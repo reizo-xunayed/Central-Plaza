@@ -1,7 +1,7 @@
 """
-Orbit renders of the building: a camera 50 ft from the building, stepped
-around the Z axis in 45-degree increments, with a high-resolution still
-rendered at every stop.
+Turntable video of the building: a camera 50 ft from the building orbits a
+full 360 degrees around the Z axis over 240 frames (10 seconds at 24 fps),
+rendered straight to an H.264 MP4.
 
 Distance is measured from the building's outside face (its plan footprint),
 not from its centre, so the camera keeps 50 ft of clearance at every angle.
@@ -9,32 +9,36 @@ At a corner view it sits 50 ft from the corner, and at a straight-on view
 it sits 50 ft from the facade. Use --from-center to measure from the
 centre point instead.
 
-Angle 0 looks at the front (the -Y side, where the entry is). Angles increase
-counter-clockwise seen from above: 0 = front, 90 = east (+X) side, 180 = rear,
-270 = west side.
+The orbit starts at the front (the -Y side, where the entry is) and turns
+counter-clockwise seen from above. The camera is keyframed on every frame and
+the last frame stops one step short of 360, so the video loops seamlessly.
+The lens is fixed for the whole orbit (wide enough for the widest view), so
+the building never appears to zoom in and out.
 
 Run headless (recommended):
-    blender -b t6_outlook.blend -P scripts/orbit_render.py -- --out ./renders/orbit
+    blender -b t6_outlook.blend -P scripts/orbit_render.py -- --out ./renders/turntable.mp4
 
 Or open the .blend in Blender, load this file in the Text Editor, and press
-Run Script. Renders then go to "renders/orbit" next to the .blend file.
+Run Script. The video then goes to "renders/turntable.mp4" next to the .blend
+file. Blender is busy until all frames are rendered.
 
 Options (everything after "--"):
-    --out DIR           output folder (default: //renders/orbit, next to the .blend)
+    --out FILE          output video (default: //renders/turntable.mp4, next to the .blend)
     --distance-ft N     clearance from the building in feet (default 50)
-    --step-deg N        rotation step around Z in degrees (default 45)
+    --frames N          frames for one full turn (default 240)
+    --fps N             frames per second (default 24)
     --height-ft N       camera height above grade in feet
                         (default: half the building height, keeps verticals straight)
     --lens-mm N         fixed focal length; by default the lens is fitted so the
                         whole building is in frame
-    --res WxH           output resolution (default 3840x2400)
+    --res WxH           output resolution, even numbers (default 3840x2160, 4K UHD)
     --samples N         override render samples (EEVEE and Cycles)
     --engine NAME       override render engine, e.g. CYCLES (default: keep the file's)
     --from-center       measure the distance from the building centre, not its facade
-    --keep-camera       leave the orbit camera in the scene afterwards
+    --keep-camera       leave the animated orbit camera in the scene afterwards
 
-The script does not save the .blend file. The scene's active camera and
-render settings are restored when it finishes.
+The script does not save the .blend file. The scene's active camera, frame
+range and render settings are restored when it finishes.
 """
 
 import argparse
@@ -43,7 +47,7 @@ import os
 import sys
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 FT = 0.3048  # metres per foot
 
@@ -59,12 +63,13 @@ FRAME_MARGIN = 1.06  # 6% breathing room around the building when fitting the le
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     p = argparse.ArgumentParser(prog="orbit_render.py")
-    p.add_argument("--out", default="//renders/orbit")
+    p.add_argument("--out", default="//renders/turntable.mp4")
     p.add_argument("--distance-ft", type=float, default=50.0)
-    p.add_argument("--step-deg", type=float, default=45.0)
+    p.add_argument("--frames", type=int, default=240)
+    p.add_argument("--fps", type=int, default=24)
     p.add_argument("--height-ft", type=float, default=None)
     p.add_argument("--lens-mm", type=float, default=None)
-    p.add_argument("--res", default="3840x2400")
+    p.add_argument("--res", default="3840x2160")
     p.add_argument("--samples", type=int, default=None)
     p.add_argument("--engine", default=None)
     p.add_argument("--from-center", action="store_true")
@@ -130,10 +135,10 @@ def orbit_position(angle_deg, center, lo, hi, distance, from_center):
     return center.x + dx * far, center.y + dy * far
 
 
-def fit_lens(cam_obj, corners, aspect):
-    """Focal length that just fits every bounding-box corner in frame."""
-    bpy.context.view_layer.update()
-    inv = cam_obj.matrix_world.inverted()
+def frame_extent(cam_matrix, corners, aspect):
+    """How wide the view must be (tan of half the horizontal field of view)
+    to fit every bounding-box corner in frame."""
+    inv = cam_matrix.inverted()
     need = 0.0
     for c in corners:
         p = inv @ c  # camera looks down its local -Z
@@ -141,9 +146,27 @@ def fit_lens(cam_obj, corners, aspect):
         if depth <= 1e-6:
             continue
         need = max(need, abs(p.x) / depth, abs(p.y) / depth * aspect)
-    need *= FRAME_MARGIN
-    cam = cam_obj.data
-    return cam.sensor_width / (2.0 * need) if need > 0 else cam.lens
+    return need * FRAME_MARGIN
+
+
+def set_video_output(render, path, fps):
+    """H.264 in an MP4 container."""
+    fmt = render.image_settings
+    if hasattr(fmt, "media_type"):  # Blender 5.0+: video formats sit behind media_type
+        fmt.media_type = "VIDEO"
+    fmt.file_format = "FFMPEG"
+    fmt.color_mode = "RGB"
+    ff = render.ffmpeg
+    ff.format = "MPEG4"
+    ff.codec = "H264"
+    ff.constant_rate_factor = "HIGH"
+    ff.ffmpeg_preset = "GOOD"
+    ff.gopsize = fps  # a keyframe every second keeps scrubbing responsive
+    ff.audio_codec = "NONE"
+    render.fps = fps
+    render.fps_base = 1.0
+    render.use_file_extension = False  # write exactly the --out path
+    render.filepath = path
 
 
 def main():
@@ -152,9 +175,13 @@ def main():
     render = scene.render
 
     res_x, res_y = (int(v) for v in args.res.lower().split("x"))
+    if res_x % 2 or res_y % 2:
+        raise ValueError("H.264 needs an even width and height, got " + args.res)
     distance = feet_to_bu(scene, args.distance_ft)
-    out_dir = bpy.path.abspath(args.out)
-    os.makedirs(out_dir, exist_ok=True)
+    out_path = bpy.path.abspath(args.out)
+    if not out_path.lower().endswith(".mp4"):
+        out_path += ".mp4"
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     lo, hi = building_bounds(scene, ground_z=0.0)
     center = (lo + hi) / 2
@@ -172,12 +199,20 @@ def main():
     )
 
     # Remember what we change so the file is left as we found it.
+    fmt = render.image_settings
+    ff = render.ffmpeg
+    prefs = bpy.context.preferences.edit
     saved = {
         "camera": scene.camera,
         "res": (render.resolution_x, render.resolution_y, render.resolution_percentage),
-        "filepath": render.filepath,
-        "format": (render.image_settings.file_format, render.image_settings.color_mode,
-                   render.image_settings.color_depth),
+        "frames": (scene.frame_start, scene.frame_end, scene.frame_step, scene.frame_current),
+        "fps": (render.fps, render.fps_base),
+        "filepath": (render.filepath, render.use_file_extension),
+        "media_type": getattr(fmt, "media_type", None),
+        "format": (fmt.file_format, fmt.color_mode, fmt.color_depth),
+        "ffmpeg": (ff.format, ff.codec, ff.constant_rate_factor, ff.ffmpeg_preset,
+                   ff.gopsize, ff.audio_codec),
+        "interpolation": prefs.keyframe_new_interpolation_type,
         "engine": render.engine,
         "eevee_samples": getattr(scene.eevee, "taa_render_samples", None),
         "cycles_samples": getattr(getattr(scene, "cycles", None), "samples", None),
@@ -195,9 +230,8 @@ def main():
     try:
         render.resolution_x, render.resolution_y = res_x, res_y
         render.resolution_percentage = 100
-        render.image_settings.file_format = "PNG"
-        render.image_settings.color_mode = "RGBA"
-        render.image_settings.color_depth = "16"
+        set_video_output(render, out_path, args.fps)
+        scene.frame_start, scene.frame_end, scene.frame_step = 1, args.frames, 1
         if args.engine:
             render.engine = args.engine
         if args.samples:
@@ -206,38 +240,68 @@ def main():
             if hasattr(scene, "cycles"):
                 scene.cycles.samples = args.samples
 
+        # Work out the camera for every frame first: position on the 50 ft
+        # path, aimed at the building's centre.
         aspect = res_x / res_y
-        steps = max(1, round(360.0 / args.step_deg))
-        for i in range(steps):
-            angle = (i * args.step_deg) % 360.0
+        poses = []
+        prev_euler = None
+        for i in range(args.frames):
+            angle = 360.0 * i / args.frames  # last frame stops one step short: seamless loop
             x, y = orbit_position(angle, center, lo, hi, distance, args.from_center)
             if distance_to_footprint(x, y, lo, hi) == 0.0:
                 print(f"Warning: at {angle:.0f} deg the camera is inside the building footprint.")
-            cam_obj.location = (x, y, cam_z)
-            look = target - cam_obj.location
-            cam_obj.rotation_euler = look.to_track_quat("-Z", "Y").to_euler()
-            cam_data.lens = args.lens_mm or fit_lens(cam_obj, corners, aspect)
+            loc = Vector((x, y, cam_z))
+            quat = (target - loc).to_track_quat("-Z", "Y")
+            # Keep each rotation continuous with the last, so the camera
+            # doesn't spin the long way round when the angle wraps past 180.
+            euler = quat.to_euler("XYZ", prev_euler) if prev_euler else quat.to_euler("XYZ")
+            prev_euler = euler
+            poses.append((loc, euler, Matrix.LocRotScale(loc, quat, None)))
 
-            path = os.path.join(out_dir, f"orbit_{i:02d}_{int(round(angle)):03d}deg.png")
-            render.filepath = path
-            print(f"[{i + 1}/{steps}] {angle:5.1f} deg  lens {cam_data.lens:.1f} mm  ->  {path}")
-            bpy.ops.render.render(write_still=True)
+        # One lens for the whole orbit, wide enough for the widest view.
+        if args.lens_mm:
+            cam_data.lens = args.lens_mm
+        else:
+            need = max(frame_extent(m, corners, aspect) for _, _, m in poses)
+            cam_data.lens = cam_data.sensor_width / (2.0 * need)
+
+        # A key on every frame, linear in between: exact distance at every frame.
+        prefs.keyframe_new_interpolation_type = "LINEAR"
+        for frame, (loc, euler, _) in enumerate(poses, start=scene.frame_start):
+            cam_obj.location = loc
+            cam_obj.rotation_euler = euler
+            cam_obj.keyframe_insert("location", frame=frame)
+            cam_obj.keyframe_insert("rotation_euler", frame=frame)
+
+        print(f"Rendering {args.frames} frames at {args.fps} fps "
+              f"({args.frames / args.fps:.1f} s), lens {cam_data.lens:.1f} mm -> {out_path}")
+        bpy.ops.render.render(animation=True)
     finally:
         scene.camera = saved["camera"]
         render.resolution_x, render.resolution_y, render.resolution_percentage = saved["res"]
-        render.filepath = saved["filepath"]
-        (render.image_settings.file_format, render.image_settings.color_mode,
-         render.image_settings.color_depth) = saved["format"]
+        scene.frame_start, scene.frame_end, scene.frame_step, frame_current = saved["frames"]
+        scene.frame_set(frame_current)
+        render.fps, render.fps_base = saved["fps"]
+        render.filepath, render.use_file_extension = saved["filepath"]
+        if saved["media_type"] is not None:
+            fmt.media_type = saved["media_type"]
+        fmt.file_format, fmt.color_mode, fmt.color_depth = saved["format"]
+        (ff.format, ff.codec, ff.constant_rate_factor, ff.ffmpeg_preset,
+         ff.gopsize, ff.audio_codec) = saved["ffmpeg"]
+        prefs.keyframe_new_interpolation_type = saved["interpolation"]
         render.engine = saved["engine"]
         if saved["eevee_samples"] is not None:
             scene.eevee.taa_render_samples = saved["eevee_samples"]
         if saved["cycles_samples"] is not None:
             scene.cycles.samples = saved["cycles_samples"]
         if not args.keep_camera:
+            action = cam_obj.animation_data.action if cam_obj.animation_data else None
             bpy.data.objects.remove(cam_obj)
             bpy.data.cameras.remove(cam_data)
+            if action is not None and action.users == 0:
+                bpy.data.actions.remove(action)
 
-    print(f"Done: {steps} renders in {out_dir}")
+    print(f"Done: {out_path}")
 
 
 if __name__ == "__main__":
